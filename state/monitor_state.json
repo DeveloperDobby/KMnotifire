@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "active_deals": {},
+  "discovery": {
+    "mode": "ranking",
+    "ids": [],
+    "current_ids": [],
+    "updated_at": ""
+  },
+  "cursor": 0,
+  "ranking_priority_cursor": 0
+}

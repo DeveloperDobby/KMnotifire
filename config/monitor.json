@@ -1,0 +1,27 @@
+{
+  "discount_percent": 20,
+  "product_ids": [],
+  "discovery": {
+    "enabled": true,
+    "mode": "ranking",
+    "urls": [
+      "/content/ranking_all-rising",
+      "/content/ranking_all-weekly",
+      "/content/ranking_all-monthly"
+    ],
+    "scroll_steps": 5,
+    "max_items_per_page": 200,
+    "refresh_seconds": 3600,
+    "priority_per_cycle": 4
+  },
+  "max_products_per_cycle": 18,
+  "max_ask_pages": 2,
+  "max_notifications_per_cycle": 20,
+  "api_gap_seconds": 0.6,
+  "timeout_seconds": 18,
+  "size_recent_sales": {
+    "enabled": true,
+    "max_pages": 2
+  },
+  "cycle_time_budget_seconds": 52
+}
