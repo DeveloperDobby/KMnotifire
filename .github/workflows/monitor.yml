@@ -1,8 +1,8 @@
 name: Ranked Deal + 60s Discord Monitor
 
 on:
-  schedule:
-    - cron: "51 2-23/3 * * *"
+#  schedule:
+#    - cron: "51 2-23/3 * * *"
   workflow_dispatch:
     inputs:
       probe_only:
