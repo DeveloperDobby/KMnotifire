@@ -1,34 +1,30 @@
-"""Discover product IDs only from the storefront's published ranking *pages*.
+"""Discover ranked product IDs using only the storefront's ranking pages.
 
-This module intentionally never falls back to search/shop/catalogue: doing so
-would silently violate a ranking-only watchlist. Ranking pages are unofficial
-HTML sources and may change; missing or blocked pages are not 'zero products'.
+A failed/blocked ranking page must never be interpreted as an empty ranking.
+The official bare/www hostnames are both supported; other storefront pages,
+search results, and unverified API endpoints are never substituted.
 """
 from __future__ import annotations
 
 import re
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlunparse
 
 from bs4 import BeautifulSoup
+from requests.exceptions import ConnectionError as HTTPConnectionError, Timeout as HTTPTimeout
 
-from site_origin import PUBLIC_ORIGIN, PUBLIC_HOSTS
+from site_origin import PUBLIC_ORIGIN, PUBLIC_HOSTS, SITE_HOST
 
 RANKING_PATH = re.compile(r'^/content/ranking_(?:all|\d+)-(?:rising|weekly|monthly)/?$')
 PRODUCT_PATH = re.compile(r'^/products/([1-9]\d*)/?$')
 HOSTS = PUBLIC_HOSTS
+TRANSIENT_STATUSES = (500, 502, 503, 504)
 
 
 class RankingBlocked(RuntimeError):
-    """A ranking page returned an explicit anti-automation HTTP status."""
+    """A ranking page was explicitly denied (403/429) and must not be retried."""
 
 
 def resolve_ranking_url(url: str) -> str:
-    """Validate a ranking-only path or an existing HTTPS site URL.
-
-    Path-only config avoids embedding an origin in monitor.json while old
-    absolute URLs remain accepted for compatibility. External hosts and
-    non-ranking pages are never accepted.
-    """
     parsed = urlparse(url)
     relative = (not parsed.scheme and not parsed.netloc and url.startswith('/'))
     absolute = (parsed.scheme == 'https' and parsed.hostname in HOSTS
@@ -43,11 +39,19 @@ def validate_ranking_url(url: str) -> None:
     resolve_ranking_url(url)
 
 
-def parse_ranking_html(html: str, *, max_items: int = 200) -> list[int]:
-    """Only product anchors on an identified ranking page; never Nuxt globals.
+def alternate_ranking_url(url: str) -> str:
+    """The *same* official ranking path on the other first-party host."""
+    parsed = urlparse(resolve_ranking_url(url))
+    other = f'www.{SITE_HOST}' if parsed.hostname == SITE_HOST else SITE_HOST
+    return urlunparse(parsed._replace(netloc=other))
 
-    Product IDs in __NUXT_DATA__ or recommended products outside <main> do not
-    prove that a product appeared in the ranking and are intentionally ignored.
+
+def parse_ranking_html(html: str, *, max_items: int = 200) -> list[int]:
+    """Trust only product links inside a visibly identified ranking page.
+
+    Embedded Nuxt data/recommendations are not proof a product appeared in the
+    ranking and are excluded. A page lacking a title or a ranking heading fails
+    rather than silently generating a generic catalogue.
     """
     soup = BeautifulSoup(html, 'html.parser')
     title = soup.title.get_text(' ', strip=True) if soup.title else ''
@@ -73,8 +77,49 @@ def parse_ranking_html(html: str, *, max_items: int = 200) -> list[int]:
     return ids
 
 
+def _status(exc: Exception) -> int | None:
+    """Extract response.status_code from requests' HTTPError without importing requests."""
+    response = getattr(exc, 'response', None)
+    return getattr(response, 'status_code', None)
+
+
+def _page_get(client, original_url: str, *, max_items: int) -> tuple[list[int], list[str]]:
+    warnings = []
+    for index, url in enumerate((original_url, alternate_ranking_url(original_url))):
+        try:
+            response = client.get(url)
+            final = urlparse(getattr(response, 'url', url))
+            requested = urlparse(url)
+            if (final.hostname not in HOSTS or final.path.rstrip('/') != requested.path.rstrip('/')):
+                raise ValueError('랭킹 페이지가 다른 경로로 이동함')
+            found = parse_ranking_html(response.text, max_items=max_items)
+            if not found:
+                raise ValueError('랭킹 목록에 상품 링크 없음')
+            if index:
+                warnings.append(f'대체 공식 호스트에서 랭킹 수집 성공: {requested.path}')
+            return found, warnings
+        except Exception as exc:
+            if exc.__class__.__name__ == 'Blocked':
+                raise
+            if _status(exc) in (403, 429):
+                raise RankingBlocked(f'랭킹 접근 거부 HTTP {_status(exc)}: {url}') from exc
+            status = _status(exc)
+            warnings.append(f'html {urlparse(url).hostname}{urlparse(url).path}: '
+                            + (f'HTTP {status}' if status else f'{type(exc).__name__}: {str(exc)[:70]}'))
+            # Try the other official hostname only for transient server/network failures.
+            # Malformed pages, 404s and unexpected redirects are not recoverable this way.
+            if status not in TRANSIENT_STATUSES and not isinstance(exc, (HTTPConnectionError, HTTPTimeout)):
+                break
+    return [], warnings
+
+
 def _browser_pages(urls: list[str], *, steps: int, max_items: int) -> tuple[dict[str, list[int]], list[str]]:
-    """Optional scrolling for lazy-loaded ranking cards, one browser per refresh."""
+    """Browser fallback for JS/lazy loading and temporary HTML failures.
+
+    A blocked status aborts instead of trying the alternative hostname. Browser
+    failures are reported by source so the previous 180-char log truncation can
+    no longer hide the browser's errors.
+    """
     from playwright.sync_api import sync_playwright
 
     output: dict[str, list[int]] = {}
@@ -83,32 +128,39 @@ def _browser_pages(urls: list[str], *, steps: int, max_items: int) -> tuple[dict
         browser = pw.chromium.launch(headless=True, args=['--no-sandbox'])
         try:
             context = browser.new_context(locale='ko-KR', viewport={'width': 1280, 'height': 900})
-            for url in urls:
-                page = context.new_page()
-                try:
-                    response = page.goto(url, wait_until='domcontentloaded', timeout=40000)
-                    if response is None or response.status in (403, 429):
-                        raise RankingBlocked(f'랭킹 브라우저 응답 거부: {url} HTTP {response.status if response else "none"}')
-                    if response.status >= 400:
-                        raise RuntimeError(f'랭킹 HTTP {response.status}: {url}')
-                    page.wait_for_timeout(800)
-                    seen, result = set(), []
-                    for step in range(steps + 1):
-                        for pid in parse_ranking_html(page.content(), max_items=max_items):
-                            if pid not in seen and len(result) < max_items:
-                                result.append(pid)
-                                seen.add(pid)
-                        if len(result) >= max_items or step == steps:
-                            break
-                        page.evaluate('window.scrollBy(0, Math.max(innerHeight * 1.5, 900))')
-                        page.wait_for_timeout(650)
-                    if not result:
-                        raise ValueError('랭킹 상품 링크 없음')
-                    output[url] = result
-                except Exception as exc:
-                    errors.append(f'browser {url}: {type(exc).__name__}: {str(exc)[:95]}')
-                finally:
-                    page.close()
+            for original in urls:
+                for candidate in (original, alternate_ranking_url(original)):
+                    page = context.new_page()
+                    try:
+                        response = page.goto(candidate, wait_until='domcontentloaded', timeout=20000)
+                        if response is None:
+                            raise RuntimeError('페이지 응답 없음')
+                        if response.status in (403, 429):
+                            raise RankingBlocked(f'브라우저 랭킹 접근 거부 HTTP {response.status}: {candidate}')
+                        if response.status >= 400:
+                            raise RuntimeError(f'HTTP {response.status}')
+                        page.wait_for_timeout(800)
+                        seen, found = set(), []
+                        for step in range(steps + 1):
+                            for pid in parse_ranking_html(page.content(), max_items=max_items):
+                                if pid not in seen and len(found) < max_items:
+                                    found.append(pid)
+                                    seen.add(pid)
+                            if len(found) >= max_items or step == steps:
+                                break
+                            page.evaluate('window.scrollBy(0, Math.max(innerHeight * 1.5, 900))')
+                            page.wait_for_timeout(650)
+                        if not found:
+                            raise ValueError('랭킹 상품 링크 없음')
+                        output[original] = found
+                        break
+                    except RankingBlocked:
+                        raise
+                    except Exception as exc:
+                        errors.append(f'browser {urlparse(candidate).hostname}{urlparse(candidate).path}: '
+                                      f'{type(exc).__name__}: {str(exc)[:70]}')
+                    finally:
+                        page.close()
         finally:
             browser.close()
     return output, errors
@@ -116,13 +168,9 @@ def _browser_pages(urls: list[str], *, steps: int, max_items: int) -> tuple[dict
 
 def collect_rankings(client, urls: list[str], *, scroll_steps: int = 0,
                      max_items_per_page: int = 200) -> tuple[list[int], list[str], list[str]]:
-    """Return (distinct IDs, successfully read URLs, warnings).
-
-    A ranking page counts as successful only if its ranking-scoped visible
-    anchors produced at least one ID. Failure of every source raises an error.
-    """
+    """Return (ranked IDs, successful sources, detailed source warnings)."""
     if not isinstance(urls, list) or not urls or len(urls) > 30:
-        raise ValueError('ranking.urls는 1~30개 공식 랭킹 URL 배열이어야 합니다')
+        raise ValueError('ranking.urls는 1~30개 랭킹 URL 배열이어야 합니다')
     for url in urls:
         if not isinstance(url, str):
             raise ValueError('ranking.urls 항목은 문자열이어야 합니다')
@@ -133,27 +181,23 @@ def collect_rankings(client, urls: list[str], *, scroll_steps: int = 0,
     ids_by_url: dict[str, list[int]] = {}
     warnings: list[str] = []
     for url in urls:
-        try:
-            response = client.get(url)
-            final_url = getattr(response, 'url', url)
-            if urlparse(final_url).path.rstrip('/') != urlparse(url).path.rstrip('/'):
-                raise ValueError('랭킹 페이지가 다른 경로로 리다이렉트됨')
-            found = parse_ranking_html(response.text, max_items=max_items_per_page)
-            if not found:
-                raise ValueError('랭킹 목록에 상품 링크 없음')
+        found, source_warnings = _page_get(client, url, max_items=max_items_per_page)
+        warnings.extend(source_warnings)
+        if found:
             ids_by_url[url] = found
-        except Exception as exc:
-            if exc.__class__.__name__ == 'Blocked':
-                raise
-            warnings.append(f'html {url}: {type(exc).__name__}: {str(exc)[:90]}')
+
     if scroll_steps:
         try:
             browser_ids, browser_errors = _browser_pages(urls, steps=scroll_steps, max_items=max_items_per_page)
             warnings.extend(browser_errors)
             for url, new_ids in browser_ids.items():
                 ids_by_url[url] = list(dict.fromkeys(ids_by_url.get(url, []) + new_ids))[:max_items_per_page]
+        except RankingBlocked as exc:
+            # Retain valid HTML rank data already gathered. Browser blocking
+            # alone must not erase legitimate ranked items.
+            warnings.append(f'browser blocked: {exc}')
         except Exception as exc:
-            warnings.append(f'browser start: {type(exc).__name__}: {str(exc)[:90]}')
+            warnings.append(f'browser start: {type(exc).__name__}: {str(exc)[:95]}')
 
     ids, seen = [], set()
     for url in urls:
@@ -162,6 +206,7 @@ def collect_rankings(client, urls: list[str], *, scroll_steps: int = 0,
                 ids.append(pid)
                 seen.add(pid)
     if not ids:
-        raise RuntimeError('모든 사이트 랭킹 페이지 탐색 실패: ' + '; '.join(warnings[:4]))
+        # Explicitly show both HTML and browser failures, unlike the old log.
+        raise RuntimeError('모든 랭킹 페이지 실패; ' + ' | '.join(warnings[:12]))
     successful = [url for url in urls if ids_by_url.get(url)]
     return ids, successful, warnings

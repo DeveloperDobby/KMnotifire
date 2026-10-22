@@ -632,7 +632,8 @@ def monitor_once(config: dict, state: dict, client: SiteClient, *, dry_run: bool
         discovered = ranking_history(state)
         state['_discovery_retry_at'] = time.monotonic() + 900
         issues += 1
-        print(f'[DISCOVERY ERROR] {type(exc).__name__}: {str(exc)[:180]}', file=sys.stderr, flush=True)
+        print(f'[DISCOVERY ERROR] {type(exc).__name__}: {str(exc)[:1800]}', file=sys.stderr, flush=True)
+        print('[DISCOVERY HELP] 공식 랭킹 HTTP 5xx는 상품 0개를 뜻하지 않습니다. HTML/브라우저 모두 실패했다면 사이트 장애 또는 실행 환경 접근 제한일 수 있습니다.', file=sys.stderr, flush=True)
     # Strictly no manually supplied or previously catalogued non-ranking IDs.
     ids = list(dict.fromkeys(parse_product_id(x) for x in discovered))
     if not ids:
