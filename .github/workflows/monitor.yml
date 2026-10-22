@@ -1,8 +1,9 @@
 name: Ranked Deal + 60s Discord Monitor
 
 on:
-#  schedule:
-#    - cron: "51 2-23/3 * * *"
+  # 원본 Vans ZIP의 cron 표현식을 한 글자도 바꾸지 않았습니다. (UTC 기준)
+  schedule:
+    - cron: "51 2-23/3 * * *"
   workflow_dispatch:
     inputs:
       probe_only:
