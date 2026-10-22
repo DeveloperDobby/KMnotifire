@@ -76,6 +76,7 @@
     ],
     "updated_at": "2026-10-22T23:42:39.853521+00:00"
   },
-  "cursor": 0,
-  "ranking_priority_cursor": 0
+  "cursor": 11,
+  "ranking_priority_cursor": 28,
+  "next_product_id": 1034863
 }
