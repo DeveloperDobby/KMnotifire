@@ -204,7 +204,7 @@ class SiteClient:
             'Accept': 'application/json, text/html;q=0.9,*/*;q=0.8',
             'Referer': f'{PUBLIC_ORIGIN}/',
             'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.6',
-            VERSION_HEADER: '30',
+            VERSION_HEADER: os.getenv('SITE_API_VERSION', '65').strip() or '65',
         })
         self.timeout = timeout
         self.gap = max(0.5, float(gap_seconds))
@@ -365,8 +365,8 @@ def get_reference(product: dict, sale: int | None, state: dict, config: dict, ra
 def shipping_kind(item: dict) -> str | None:
     """Only notify when API marks delivery mode unambiguously.
 
-    null/missing is documented in some unauthenticated asks responses and is
-    ambiguous; DO NOT incorrectly label it regular delivery.
+    A full ask row with an explicit null immediate-delivery flag is regular
+    delivery in the matched browser JSON/HTML sample; missing fields stay unknown.
     """
     # Never include explicitly overseas delivery, even when the immediate flag is false.
     if item.get('is_overseas_delivery_item') is True or item.get('is_overseas') is True:
@@ -384,6 +384,13 @@ def shipping_kind(item: dict) -> str | None:
     if value is True:
         return '빠른배송'
     if value is False:
+        return '일반배송'
+    # Verified against 50 current ask rows and their rendered storefront HTML:
+    # a present null flag with full ask fields corresponds to a listing without
+    # the express-delivery icon.  Do not apply this to missing/incomplete fields.
+    if ('is_immediate_delivery_item' in item and value is None
+            and item.get('option') and item.get('price') is not None
+            and item.get('quantity') is not None):
         return '일반배송'
     return None
 
