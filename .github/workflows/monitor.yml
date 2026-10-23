@@ -11,6 +11,15 @@ on:
         type: boolean
         default: false
         required: false
+      api_transport:
+        description: "API 비교 방식 (default는 저장소 변수 SITE_API_TRANSPORT 또는 requests 사용)"
+        type: choice
+        options:
+          - default
+          - requests
+          - chromium
+        default: default
+        required: false
 
 permissions:
   contents: write
@@ -20,6 +29,11 @@ jobs:
   launch:
     runs-on: ubuntu-latest
     timeout-minutes: 359
+    env:
+      SITE_API_TRANSPORT: ${{ (inputs.api_transport != '' && inputs.api_transport != 'default' && inputs.api_transport) || vars.SITE_API_TRANSPORT || 'requests' }}
+      SITE_API_VERSION: ${{ vars.SITE_API_VERSION || '65' }}
+      SITE_WEB_BUILD_VERSION: ${{ vars.SITE_WEB_BUILD_VERSION || '26.14.1' }}
+      PYTHONUNBUFFERED: "1"
     steps:
       - name: Cancel older scheduled monitoring runs
         if: ${{ inputs.probe_only != true }}
@@ -58,7 +72,7 @@ jobs:
 
       - name: Install Chromium for ranking discovery and probe
         run: |
-          if python -c 'import json,sys; c=json.load(open("config/monitor.json")); sys.exit(0 if c.get("discovery",{}).get("enabled",True) else 1)'; then
+          if python -c 'import json,os,sys; c=json.load(open("config/monitor.json")); sys.exit(0 if c.get("discovery",{}).get("enabled",True) or os.getenv("SITE_API_TRANSPORT") == "chromium" else 1)'; then
             python -m playwright install --with-deps chromium
           fi
 
