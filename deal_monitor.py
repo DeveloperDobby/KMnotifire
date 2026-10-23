@@ -16,6 +16,7 @@ import re
 import subprocess
 import sys
 import time
+import uuid
 from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
@@ -224,7 +225,22 @@ class SiteClient:
         if sleep > 0:
             time.sleep(sleep)
         self.next_request_at = time.monotonic() + self.gap
-        response = self.session.get(url, params=params, timeout=self.timeout)
+        # The website's observed browser GET includes public client-version and
+        # local-time metadata. None of these are account credentials or a way to
+        # bypass access restrictions. Do NOT copy browser Bearer tokens here.
+        headers = {}
+        if host == f'api.{SITE_HOST}':
+            prefix = SITE_HOST.split('.', 1)[0]
+            headers = {
+                'Accept': 'application/json',
+                'Origin': PUBLIC_ORIGIN,
+                f'x-{prefix}-client-datetime': datetime.now(
+                    timezone(timedelta(hours=9))).strftime('%Y%m%d%H%M%S%z'),
+            }
+            build = os.getenv('SITE_WEB_BUILD_VERSION', '26.14.1').strip()
+            if build:
+                headers[f'x-{prefix}-web-build-version'] = build
+        response = self.session.get(url, params=params, headers=headers, timeout=self.timeout)
         if response.status_code in (403, 429):
             self.blocked_until = time.monotonic() + max(60, int(os.getenv('SITE_BLOCK_BACKOFF_SECONDS', '900')))
             raise Blocked(f'상점 HTTP {response.status_code}: GitHub 러너 요청 거부/제한')
@@ -242,7 +258,12 @@ class SiteClient:
     def api_items(self, pid: int, kind: str, cursor: int | str = 1, per_page: int = 50) -> dict:
         if kind not in ('asks', 'sales'):
             raise ValueError('잘못된 API 종류')
-        resp = self.get(f'{API_ORIGIN}/api/p/products/{pid}/{kind}', {'cursor': cursor, 'per_page': per_page})
+        # Current browser requests include an empty sort field and a unique
+        # request_key. The UUID is not an auth token and is never persisted.
+        resp = self.get(f'{API_ORIGIN}/api/p/products/{pid}/{kind}', {
+            'cursor': cursor, 'per_page': per_page, 'sort': '',
+            'request_key': str(uuid.uuid4()),
+        })
         try:
             raw = resp.json()
         except ValueError as exc:
@@ -868,7 +889,42 @@ def _probe_endpoint(label: str, action) -> tuple[bool, dict]:
                   'reason': str(exc)[:180]}
         if status is not None:
             result['http_status'] = status
+            response = getattr(exc, 'response', None)
+            # Response metadata only. Never put request query, response body,
+            # auth/cookie values, or account data into GitHub Actions logs.
+            hdr = getattr(response, 'headers', {}) or {}
+            result['response_server'] = str(hdr.get('Server', ''))[:80]
+            result['response_content_type'] = str(hdr.get('Content-Type', ''))[:80]
+            result['response_via'] = str(hdr.get('Via', ''))[:80]
+            result['response_length'] = str(hdr.get('Content-Length', ''))[:25]
+            result['reason'] = f'HTTP {status}; endpoint returned an error'
         return False, result
+
+
+def probe_static_reachability(client: SiteClient) -> dict:
+    """One safe static GET distinguishes wide network failures from app-only failures.
+
+    Does not prove product API access and never transmits user credentials.
+    """
+    start = time.monotonic()
+    try:
+        response = client.session.get(
+            f'{PUBLIC_ORIGIN}/robots.txt', timeout=min(8, client.timeout),
+            headers={'Accept': 'text/plain'},
+        )
+        return {
+            'http_status': response.status_code,
+            'elapsed_seconds': round(time.monotonic() - start, 2),
+            'response_server': response.headers.get('Server', '')[:80],
+            'response_content_type': response.headers.get('Content-Type', '')[:80],
+            'note': 'Static-path status only; not evidence that product APIs work',
+        }
+    except requests.RequestException as exc:
+        return {
+            'status': 'network_error',
+            'error_type': type(exc).__name__,
+            'elapsed_seconds': round(time.monotonic() - start, 2),
+        }
 
 
 def probe(config: dict, state_file: Path | None = None) -> int:
@@ -879,6 +935,7 @@ def probe(config: dict, state_file: Path | None = None) -> int:
     Ranking failure remains a failure in the final diagnostic exit code.
     """
     client = SiteClient(int(config.get('timeout_seconds', 18)), float(config.get('api_gap_seconds', 2)))
+    print('[PROBE NETWORK]', json.dumps(probe_static_reachability(client), ensure_ascii=False), flush=True)
     settings = config['discovery']
     successful, warnings, ranking_error = [], [], None
     try:
