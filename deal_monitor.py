@@ -825,8 +825,49 @@ def loop(config_file: Path, state_file: Path, *, interval: int, duration: int, g
     return 0 if success else 1
 
 
+def _probe_endpoint(label: str, action) -> tuple[bool, dict]:
+    """Probe one independent data source; never infer a sellable offer from another source.
+
+    Do not log response bodies, cookies, or request headers: these may contain
+    private debugging details and add no value for identifying HTTP failures.
+    """
+    start = time.monotonic()
+    try:
+        data = action()
+        result = {'status': 'ok', 'elapsed_seconds': round(time.monotonic() - start, 2)}
+        if label == 'product':
+            result['name'] = data.get('name', '')[:100]
+            result['release'] = [str(v) for v in data['retail']] if data.get('retail') else None
+        elif label == 'sales':
+            price, sizes = data
+            result['recent_sale_krw'] = price
+            result['size_sale_count'] = len(sizes)
+        elif label == 'asks':
+            by_shipping = {'일반배송': 0, '빠른배송': 0, '미확인': 0}
+            for item in data:
+                by_shipping[shipping_kind(item) or '미확인'] += 1
+            result['asks_first_page'] = len(data)
+            result['shipping_fields'] = by_shipping
+        return True, result
+    except Exception as exc:
+        status = getattr(getattr(exc, 'response', None), 'status_code', None)
+        # Errors are evidence of an inaccessible source, not absence of offers
+        # or a price. Limit detail so GitHub logs remain readable.
+        result = {'status': 'error', 'type': type(exc).__name__,
+                  'elapsed_seconds': round(time.monotonic() - start, 2),
+                  'reason': str(exc)[:180]}
+        if status is not None:
+            result['http_status'] = status
+        return False, result
+
+
 def probe(config: dict) -> int:
-    """Diagnose rankings independently from PDP / ask API compatibility."""
+    """Check rankings, PDP, sales and asks separately for several ranked IDs.
+
+    Earlier probes stopped at the first failed PDP or /sales request, so it was
+    impossible to know if /asks worked. In diagnostic mode no sale/retail/ask
+    fallback is invented: each surface is reported with its own result.
+    """
     client = SiteClient(int(config.get('timeout_seconds', 18)), float(config.get('api_gap_seconds', 2)))
     settings = config['discovery']
     try:
@@ -842,33 +883,38 @@ def probe(config: dict) -> int:
                       'ranking_urls_succeeded': len(successful),
                       'ranking_product_ids': len(found),
                       'ranking_sample_ids': found[:10],
-                      'ranking_warnings': warnings[:10]}, ensure_ascii=False, indent=2))
-    # A ranked product can be a brand-direct item with no secondary-market
-    # asks/sales. Don't assume the first ranked ID represents API compatibility.
-    errors = []
-    for pid in found[:6]:
-        try:
-            product = client.product(pid)
-            sale, sample_sizes = client.sales_by_size(pid, max_pages=1)
-            asks = client.asks(pid, max_pages=1)
-            by_shipping = {'일반배송': 0, '빠른배송': 0, '미확인': 0}
-            for item in asks:
-                by_shipping[shipping_kind(item) or '미확인'] += 1
-            print(json.dumps({'product_id': pid, 'product_name': product['name'],
-                              'release': [str(x) for x in product['retail']] if product['retail'] else None,
-                              'recent_sale_krw': sale,
-                              'size_recent_sale_sample': dict(list(sample_sizes.items())[:5]),
-                              'asks_first_page': len(asks), 'shipping_fields': by_shipping,
-                              'caution': '미확인 배송은 오탐 방지를 위해 알림 제외'}, ensure_ascii=False, indent=2))
-            return 0 if len(successful) == len(settings['urls']) else 1
-        except Blocked as exc:
-            print(f'[PROBE PRODUCT BLOCKED] {pid}: {exc}', file=sys.stderr)
-            return 1
-        except Exception as exc:
-            errors.append(f'{pid}: {type(exc).__name__}: {str(exc)[:100]}')
-    print('[PROBE PRODUCT FAILED] 랭킹 수집은 성공했지만 상품/거래/매도호가 API는 확인되지 않았습니다. '
-          + '; '.join(errors), file=sys.stderr)
-    return 1
+                      'ranking_warnings': warnings[:10]}, ensure_ascii=False, indent=2), flush=True)
+
+    checked: list[dict] = []
+    full_success = False
+    for pid in found[:4]:
+        # The storefront may expose ranked retail-only goods without asks or
+        # past sales. Use multiple ranked products to avoid a false conclusion.
+        sources = {}
+        ok_product, sources['product'] = _probe_endpoint('product', lambda: client.product(pid))
+        ok_sales, sources['sales'] = _probe_endpoint('sales', lambda: client.sales_by_size(pid, max_pages=1))
+        ok_asks, sources['asks'] = _probe_endpoint('asks', lambda: client.asks(pid, max_pages=1))
+        checked.append({'product_id': pid, 'sources': sources})
+        print('[PROBE PRODUCT]', json.dumps(checked[-1], ensure_ascii=False), flush=True)
+        if ok_product and ok_sales and ok_asks:
+            full_success = True
+            break
+        if time.monotonic() < client.blocked_until:
+            print('[PROBE STOP] HTTP 403/429 대기 요청을 반복하지 않습니다', file=sys.stderr, flush=True)
+            break
+
+    summary = {'checked_products': len(checked),
+               'product_success': sum(x['sources']['product']['status'] == 'ok' for x in checked),
+               'sales_success': sum(x['sources']['sales']['status'] == 'ok' for x in checked),
+               'asks_success': sum(x['sources']['asks']['status'] == 'ok' for x in checked),
+               'complete_product_success': full_success,
+               'ranking_success': len(successful) == len(settings['urls'])}
+    print('[PROBE SUMMARY]', json.dumps(summary, ensure_ascii=False), flush=True)
+    if not full_success:
+        print('[PROBE PRODUCT FAILED] 최근거래가, 상품 상세 및 매도 호가는 각각 독립적으로 확인했습니다. '
+              '실패한 소스는 가격/재고 없음이 아니며, 500 응답을 우회하거나 가짜 가격으로 대체하지 않습니다.',
+              file=sys.stderr, flush=True)
+    return 0 if full_success and summary['ranking_success'] else 1
 
 
 def main() -> int:
