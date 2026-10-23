@@ -83,8 +83,9 @@ def _status(exc: Exception) -> int | None:
     return getattr(response, 'status_code', None)
 
 
-def _page_get(client, original_url: str, *, max_items: int) -> tuple[list[int], list[str]]:
+def _page_get(client, original_url: str, *, max_items: int) -> tuple[list[int], list[str], bool]:
     warnings = []
+    statuses: list[int | None] = []
     for index, url in enumerate((original_url, alternate_ranking_url(original_url))):
         try:
             response = client.get(url)
@@ -97,20 +98,21 @@ def _page_get(client, original_url: str, *, max_items: int) -> tuple[list[int], 
                 raise ValueError('랭킹 목록에 상품 링크 없음')
             if index:
                 warnings.append(f'대체 공식 호스트에서 랭킹 수집 성공: {requested.path}')
-            return found, warnings
+            return found, warnings, False
         except Exception as exc:
             if exc.__class__.__name__ == 'Blocked':
                 raise
             if _status(exc) in (403, 429):
                 raise RankingBlocked(f'랭킹 접근 거부 HTTP {_status(exc)}: {url}') from exc
             status = _status(exc)
+            statuses.append(status)
             warnings.append(f'html {urlparse(url).hostname}{urlparse(url).path}: '
                             + (f'HTTP {status}' if status else f'{type(exc).__name__}: {str(exc)[:70]}'))
             # Try the other official hostname only for transient server/network failures.
             # Malformed pages, 404s and unexpected redirects are not recoverable this way.
             if status not in TRANSIENT_STATUSES and not isinstance(exc, (HTTPConnectionError, HTTPTimeout)):
                 break
-    return [], warnings
+    return [], warnings, len(statuses) == 2 and all(s in TRANSIENT_STATUSES for s in statuses)
 
 
 def _browser_pages(urls: list[str], *, steps: int, max_items: int) -> tuple[dict[str, list[int]], list[str]]:
@@ -168,7 +170,8 @@ def _browser_pages(urls: list[str], *, steps: int, max_items: int) -> tuple[dict
 
 def collect_rankings(client, urls: list[str], *, scroll_steps: int = 0,
                      max_items_per_page: int = 200,
-                     scroll_on_html_success: bool = False) -> tuple[list[int], list[str], list[str]]:
+                     scroll_on_html_success: bool = False,
+                     browser_retry_on_server_error: bool = False) -> tuple[list[int], list[str], list[str]]:
     """Return (ranked IDs, successful sources, detailed source warnings)."""
     if not isinstance(urls, list) or not urls or len(urls) > 30:
         raise ValueError('ranking.urls는 1~30개 랭킹 URL 배열이어야 합니다')
@@ -181,9 +184,12 @@ def collect_rankings(client, urls: list[str], *, scroll_steps: int = 0,
 
     ids_by_url: dict[str, list[int]] = {}
     warnings: list[str] = []
+    all_hosts_server_error: set[str] = set()
     for url in urls:
-        found, source_warnings = _page_get(client, url, max_items=max_items_per_page)
+        found, source_warnings, full_server_error = _page_get(client, url, max_items=max_items_per_page)
         warnings.extend(source_warnings)
+        if full_server_error:
+            all_hosts_server_error.add(url)
         if found:
             ids_by_url[url] = found
 
@@ -192,6 +198,12 @@ def collect_rankings(client, urls: list[str], *, scroll_steps: int = 0,
     # JS-scroll discovery when the environment can serve browser traffic.
     browser_targets = (urls if scroll_on_html_success else
                        [url for url in urls if url not in ids_by_url])
+    if not browser_retry_on_server_error:
+        skipped = [url for url in browser_targets if url in all_hosts_server_error]
+        browser_targets = [url for url in browser_targets if url not in all_hosts_server_error]
+        if skipped:
+            warnings.append(f'동일 랭킹의 두 공식 호스트가 모두 HTTP 5xx: '
+                            f'{len(skipped)}개 페이지에서 중복 브라우저 시도 생략')
     if scroll_steps and browser_targets:
         try:
             browser_ids, browser_errors = _browser_pages(browser_targets, steps=scroll_steps, max_items=max_items_per_page)

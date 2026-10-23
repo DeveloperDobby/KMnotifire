@@ -447,6 +447,7 @@ def discover(config: dict, state: dict, client: SiteClient | None = None) -> lis
         scroll_steps=int(settings.get('scroll_steps', 0)),
         max_items_per_page=int(settings.get('max_items_per_page', 200)),
         scroll_on_html_success=bool(settings.get('scroll_on_html_success', False)),
+        browser_retry_on_server_error=bool(settings.get('browser_retry_on_server_error', False)),
     )
     for warning in warnings:
         print(f'[RANKING WARNING] {warning}', file=sys.stderr, flush=True)
@@ -492,6 +493,8 @@ def validate_config(config: dict) -> None:
         validate_ranking_url(url)
     if not isinstance(settings.get('scroll_on_html_success', False), bool):
         raise ValueError('scroll_on_html_success는 boolean이어야 합니다')
+    if not isinstance(settings.get('browser_retry_on_server_error', False), bool):
+        raise ValueError('browser_retry_on_server_error는 boolean이어야 합니다')
     if not (2 <= int(config.get('service_5xx_threshold', 3)) <= 10):
         raise ValueError('service_5xx_threshold 범위는 2~10입니다')
     if not (60 <= int(config.get('service_5xx_pause_seconds', 300)) <= 3600):
@@ -861,29 +864,49 @@ def _probe_endpoint(label: str, action) -> tuple[bool, dict]:
         return False, result
 
 
-def probe(config: dict) -> int:
-    """Check rankings, PDP, sales and asks separately for several ranked IDs.
+def probe(config: dict, state_file: Path | None = None) -> int:
+    """Diagnose each source independently, even if this run's ranking is down.
 
-    Earlier probes stopped at the first failed PDP or /sales request, so it was
-    impossible to know if /asks worked. In diagnostic mode no sale/retail/ask
-    fallback is invented: each surface is reported with its own result.
+    Only product IDs previously *proven* to be ranked in the persisted state
+    can be used when rankings return errors. No product or price is fabricated.
+    Ranking failure remains a failure in the final diagnostic exit code.
     """
     client = SiteClient(int(config.get('timeout_seconds', 18)), float(config.get('api_gap_seconds', 2)))
     settings = config['discovery']
+    successful, warnings, ranking_error = [], [], None
     try:
         found, successful, warnings = collect_rankings(
             client, settings['urls'], scroll_steps=int(settings.get('scroll_steps', 0)),
             max_items_per_page=int(settings.get('max_items_per_page', 200)),
-            scroll_on_html_success=bool(settings.get('scroll_on_html_success', False)))
+            scroll_on_html_success=bool(settings.get('scroll_on_html_success', False)),
+            browser_retry_on_server_error=bool(settings.get('browser_retry_on_server_error', False)))
     except Exception as exc:
-        print(f'[PROBE RANKING FAILED] {type(exc).__name__}: {exc}', file=sys.stderr)
-        return 1
+        ranking_error = f'{type(exc).__name__}: {str(exc)[:1800]}'
+        print(f'[PROBE RANKING FAILED] {ranking_error}', file=sys.stderr, flush=True)
+        found = []
+        # Prefer an existing git-synced state: this is ranking provenance, not
+        # an arbitrary product-ID fallback or a replacement for a fresh ranking.
+        state_file = state_file or Path('state/monitor_state.json')
+        if state_file.exists():
+            try:
+                found = ranking_history(read_state(state_file))
+            except (OSError, ValueError, TypeError, KeyError) as state_exc:
+                print(f'[PROBE HISTORY ERROR] {type(state_exc).__name__}: '
+                      f'{str(state_exc)[:150]}', file=sys.stderr, flush=True)
+        if found:
+            print(f'[PROBE HISTORY] 신규 랭킹 확인 실패. 이전에 확인된 랭킹 상품 '
+                  f'{len(found)}개로 상품 API를 별도 진단합니다 (랭킹 성공으로 간주하지 않음).', flush=True)
+        else:
+            print('[PROBE HISTORY] 저장된 랭킹 상품 ID가 없습니다. '
+                  '상품 API까지 확인할 수 없습니다.', file=sys.stderr, flush=True)
 
-    print(json.dumps({'ranking_urls_checked': len(settings['urls']),
+    print('[PROBE RANKING]', json.dumps({'ranking_urls_checked': len(settings['urls']),
                       'ranking_urls_succeeded': len(successful),
                       'ranking_product_ids': len(found),
                       'ranking_sample_ids': found[:10],
-                      'ranking_warnings': warnings[:10]}, ensure_ascii=False, indent=2), flush=True)
+                      'ranking_source': 'current' if ranking_error is None else ('history' if found else 'none'),
+                      'ranking_error': ranking_error,
+                      'ranking_warnings': warnings[:10]}, ensure_ascii=False), flush=True)
 
     checked: list[dict] = []
     full_success = False
@@ -902,13 +925,18 @@ def probe(config: dict) -> int:
         if time.monotonic() < client.blocked_until:
             print('[PROBE STOP] HTTP 403/429 대기 요청을 반복하지 않습니다', file=sys.stderr, flush=True)
             break
+        if all(v.get('http_status') in (500, 502, 503, 504) for v in sources.values()):
+            print('[PROBE STOP] 상품 상세/최근거래가/매도호가가 모두 HTTP 5xx입니다. '
+                  '동일 실행에서 다른 상품에 반복 요청하지 않습니다.', file=sys.stderr, flush=True)
+            break
 
     summary = {'checked_products': len(checked),
                'product_success': sum(x['sources']['product']['status'] == 'ok' for x in checked),
                'sales_success': sum(x['sources']['sales']['status'] == 'ok' for x in checked),
                'asks_success': sum(x['sources']['asks']['status'] == 'ok' for x in checked),
                'complete_product_success': full_success,
-               'ranking_success': len(successful) == len(settings['urls'])}
+               'ranking_success': ranking_error is None and len(successful) == len(settings['urls']),
+               'ranking_from_saved_history': ranking_error is not None and bool(found)}
     print('[PROBE SUMMARY]', json.dumps(summary, ensure_ascii=False), flush=True)
     if not full_success:
         print('[PROBE PRODUCT FAILED] 최근거래가, 상품 상세 및 매도 호가는 각각 독립적으로 확인했습니다. '
@@ -931,7 +959,7 @@ def main() -> int:
     config = load_json(args.config)
     validate_config(config)
     if args.probe:
-        return probe(config)
+        return probe(config, args.state)
     interval = int(os.getenv('CHECK_INTERVAL_SECONDS', '60'))
     duration = int(os.getenv('RUN_DURATION_SECONDS', '21480')) if args.loop else 1
     if interval <= 0 or duration <= 0:
