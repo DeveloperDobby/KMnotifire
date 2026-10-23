@@ -33,7 +33,9 @@
     "headers": {
       "api_version": "x-kream-api-version",
       "client_time": "x-kream-client-datetime",
-      "build_version": "x-kream-web-build-version"
+      "build_version": "x-kream-web-build-version",
+      "device_id": "x-kream-device-id",
+      "web_request": "x-kream-web-request-secret"
     }
   }
 }
