@@ -12,7 +12,8 @@
     "scroll_steps": 5,
     "max_items_per_page": 200,
     "refresh_seconds": 3600,
-    "priority_per_cycle": 4
+    "priority_per_cycle": 4,
+    "scroll_on_html_success": false
   },
   "max_products_per_cycle": 18,
   "max_ask_pages": 2,
@@ -23,5 +24,7 @@
     "enabled": true,
     "max_pages": 2
   },
-  "cycle_time_budget_seconds": 52
+  "cycle_time_budget_seconds": 52,
+  "service_5xx_threshold": 3,
+  "service_5xx_pause_seconds": 300
 }

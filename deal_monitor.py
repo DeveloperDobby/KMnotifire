@@ -210,6 +210,8 @@ class SiteClient:
         self.gap = max(0.5, float(gap_seconds))
         self.next_request_at = 0.0
         self.blocked_until = 0.0
+        self.consecutive_product_5xx = 0
+        self.product_pause_until = 0.0
 
     def get(self, url: str, params: dict | None = None) -> requests.Response:
         host = urlparse(url).hostname
@@ -444,6 +446,7 @@ def discover(config: dict, state: dict, client: SiteClient | None = None) -> lis
         urls,
         scroll_steps=int(settings.get('scroll_steps', 0)),
         max_items_per_page=int(settings.get('max_items_per_page', 200)),
+        scroll_on_html_success=bool(settings.get('scroll_on_html_success', False)),
     )
     for warning in warnings:
         print(f'[RANKING WARNING] {warning}', file=sys.stderr, flush=True)
@@ -487,6 +490,12 @@ def validate_config(config: dict) -> None:
         raise ValueError('ranking.urls에 허용된 공식 랭킹 페이지 1~30개가 필요합니다')
     for url in urls:
         validate_ranking_url(url)
+    if not isinstance(settings.get('scroll_on_html_success', False), bool):
+        raise ValueError('scroll_on_html_success는 boolean이어야 합니다')
+    if not (2 <= int(config.get('service_5xx_threshold', 3)) <= 10):
+        raise ValueError('service_5xx_threshold 범위는 2~10입니다')
+    if not (60 <= int(config.get('service_5xx_pause_seconds', 300)) <= 3600):
+        raise ValueError('service_5xx_pause_seconds 범위는 60~3600초입니다')
     if not (0 <= int(settings.get('scroll_steps', 0)) <= 15):
         raise ValueError('scroll_steps 범위는 0~15입니다')
     if not (1 <= int(settings.get('max_items_per_page', 200)) <= 1000):
@@ -634,6 +643,27 @@ def monitor_once(config: dict, state: dict, client: SiteClient, *, dry_run: bool
         issues += 1
         print(f'[DISCOVERY ERROR] {type(exc).__name__}: {str(exc)[:1800]}', file=sys.stderr, flush=True)
         print('[DISCOVERY HELP] 공식 랭킹 HTTP 5xx는 상품 0개를 뜻하지 않습니다. HTML/브라우저 모두 실패했다면 사이트 장애 또는 실행 환경 접근 제한일 수 있습니다.', file=sys.stderr, flush=True)
+    ranking_elapsed = time.monotonic() - cycle_started
+    if ranking_elapsed >= budget / 2:
+        print(f'[RANKING TIMING] 랭킹 수집에 {ranking_elapsed:.1f}초 사용; '
+              '60초 주기 예산에 포함됩니다', flush=True)
+    # Suppress repeated requests after correlated product 5xx failures.
+    # Ranking discovery is separate and retains its append-only history.
+    # Use instance data rather than Mock auto-generated attributes (also keeps
+    # older client adapters compatible with the monitoring loop).
+    client_state = vars(client)
+    if not isinstance(client_state.get('consecutive_product_5xx'), int):
+        client.consecutive_product_5xx = 0
+    pause_left = client_state.get('product_pause_until', 0.0) - time.monotonic()
+    if pause_left > 0:
+        print(f'[SERVICE PAUSE] 상품 상세/거래/호가 요청 연속 HTTP 5xx; '
+              f'{pause_left:.0f}초 뒤 재개. 수집 목록과 알림 이력 유지', flush=True)
+        return 1, state
+    blocked_left = client_state.get('blocked_until', 0.0) - time.monotonic()
+    if blocked_left > 0:
+        print(f'[SERVICE PAUSE] 사이트 HTTP 403/429 재시도 대기 {blocked_left:.0f}초. '
+              '기존 상태 유지', flush=True)
+        return 1, state
     # Strictly no manually supplied or previously catalogued non-ranking IDs.
     ids = list(dict.fromkeys(parse_product_id(x) for x in discovered))
     if not ids:
@@ -700,6 +730,7 @@ def monitor_once(config: dict, state: dict, client: SiteClient, *, dry_run: bool
                 previous[deal['key']] = {'price': deal['price']}
                 notifications += 1
             good += 1
+            client.consecutive_product_5xx = 0
             if track == 'priority':
                 next_priority = (current_position[pid] + 1) % len(current_ranked)
             else:
@@ -716,11 +747,31 @@ def monitor_once(config: dict, state: dict, client: SiteClient, *, dry_run: bool
             break
         except Exception as exc:
             issues += 1
-            if track == 'priority':
+            status = getattr(getattr(exc, 'response', None), 'status_code', None)
+            repeated_5xx = status in (500, 502, 503, 504)
+            if repeated_5xx:
+                client.consecutive_product_5xx += 1
+            else:
+                client.consecutive_product_5xx = 0
+            pause_triggered = repeated_5xx and (
+                client.consecutive_product_5xx >= int(config.get('service_5xx_threshold', 3)))
+            if pause_triggered:
+                client.product_pause_until = time.monotonic() + int(config.get('service_5xx_pause_seconds', 300))
+                # Revisit the final failed item when service calls recover.
+                if track == 'priority':
+                    next_priority = current_position[pid]
+                else:
+                    next_history = position_by_id[pid]
+            elif track == 'priority':
                 next_priority = (current_position[pid] + 1) % len(current_ranked)
             else:
                 next_history = (position_by_id[pid] + 1) % len(ids)
             print(f'[ERROR] {pid}: {type(exc).__name__}: {str(exc)[:160]}', file=sys.stderr, flush=True)
+            if pause_triggered:
+                print(f'[SERVICE PAUSE] 연속 HTTP 5xx {client.consecutive_product_5xx}회. '
+                      f'{int(config.get("service_5xx_pause_seconds", 300))}초 동안 상품 API 요청 중지. '
+                      '실제 판매가 조회 실패이므로 핫딜 판정 보류', flush=True)
+                break
         finally:
             last_product_seconds = max(0.1, time.monotonic() - item_started)
     state['_runtime_cursor'] = next_history
@@ -781,7 +832,8 @@ def probe(config: dict) -> int:
     try:
         found, successful, warnings = collect_rankings(
             client, settings['urls'], scroll_steps=int(settings.get('scroll_steps', 0)),
-            max_items_per_page=int(settings.get('max_items_per_page', 200)))
+            max_items_per_page=int(settings.get('max_items_per_page', 200)),
+            scroll_on_html_success=bool(settings.get('scroll_on_html_success', False)))
     except Exception as exc:
         print(f'[PROBE RANKING FAILED] {type(exc).__name__}: {exc}', file=sys.stderr)
         return 1

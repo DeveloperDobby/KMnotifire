@@ -167,7 +167,8 @@ def _browser_pages(urls: list[str], *, steps: int, max_items: int) -> tuple[dict
 
 
 def collect_rankings(client, urls: list[str], *, scroll_steps: int = 0,
-                     max_items_per_page: int = 200) -> tuple[list[int], list[str], list[str]]:
+                     max_items_per_page: int = 200,
+                     scroll_on_html_success: bool = False) -> tuple[list[int], list[str], list[str]]:
     """Return (ranked IDs, successful sources, detailed source warnings)."""
     if not isinstance(urls, list) or not urls or len(urls) > 30:
         raise ValueError('ranking.urls는 1~30개 랭킹 URL 배열이어야 합니다')
@@ -186,9 +187,14 @@ def collect_rankings(client, urls: list[str], *, scroll_steps: int = 0,
         if found:
             ids_by_url[url] = found
 
-    if scroll_steps:
+    # HTML succeeded: don't spend the entire 60-second scan opening the
+    # same ranking again in a browser. Allow an explicit opt-in for richer
+    # JS-scroll discovery when the environment can serve browser traffic.
+    browser_targets = (urls if scroll_on_html_success else
+                       [url for url in urls if url not in ids_by_url])
+    if scroll_steps and browser_targets:
         try:
-            browser_ids, browser_errors = _browser_pages(urls, steps=scroll_steps, max_items=max_items_per_page)
+            browser_ids, browser_errors = _browser_pages(browser_targets, steps=scroll_steps, max_items=max_items_per_page)
             warnings.extend(browser_errors)
             for url, new_ids in browser_ids.items():
                 ids_by_url[url] = list(dict.fromkeys(ids_by_url.get(url, []) + new_ids))[:max_items_per_page]
