@@ -12,7 +12,7 @@ from urllib.parse import urljoin, urlparse, urlunparse
 from bs4 import BeautifulSoup
 from requests.exceptions import ConnectionError as HTTPConnectionError, Timeout as HTTPTimeout
 
-from site_origin import PUBLIC_ORIGIN, PUBLIC_HOSTS, SITE_HOST
+from storefront import PUBLIC_ORIGIN, PUBLIC_HOSTS, STOREFRONT_HOST
 
 RANKING_PATH = re.compile(r'^/content/ranking_(?:all|\d+)-(?:rising|weekly|monthly)/?$')
 PRODUCT_PATH = re.compile(r'^/products/([1-9]\d*)/?$')
@@ -42,7 +42,7 @@ def validate_ranking_url(url: str) -> None:
 def alternate_ranking_url(url: str) -> str:
     """The *same* official ranking path on the other first-party host."""
     parsed = urlparse(resolve_ranking_url(url))
-    other = f'www.{SITE_HOST}' if parsed.hostname == SITE_HOST else SITE_HOST
+    other = f'www.{STOREFRONT_HOST}' if parsed.hostname == STOREFRONT_HOST else STOREFRONT_HOST
     return urlunparse(parsed._replace(netloc=other))
 
 

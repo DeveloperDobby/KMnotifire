@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Ranked-product hot-deal monitor. Read-only storefront access; Discord webhook notifications.
 
-No RADAR executable, site login or cookies required. Unofficial Storefront APIs may
+No external executable, site login or cookies required. Unofficial Storefront APIs may
 change or refuse GitHub-hosted runner traffic; failures never mean 'sold out'.
 """
 from __future__ import annotations
@@ -24,7 +24,7 @@ import requests
 from product_metadata import parse_pdp_nuxt_retail
 from ranking_sources import collect_rankings, validate_ranking_url
 
-from site_origin import PUBLIC_ORIGIN, API_ORIGIN, PUBLIC_HOSTS, REQUEST_HOSTS, SITE_HOST, VERSION_HEADER
+from storefront import PUBLIC_ORIGIN, API_ORIGIN, PUBLIC_HOSTS, REQUEST_HOSTS, STOREFRONT_HOST, API_VERSION_HEADER, CLIENT_TIME_HEADER, BUILD_VERSION_HEADER
 STATE_VERSION = 1
 ID_PATTERN = re.compile(r'/products/(\d+)(?:[/?#]|$)')
 CURRENCY_PATTERN = re.compile(r'\$\s*([\d,]+(?:\.\d+)?)|(?:USD|US\$)\s*([\d,]+(?:\.\d+)?)|([\d,]+(?:\.\d+)?)\s*(?:원|KRW)|([\d,]+(?:\.\d+)?)\s*(?:USD|달러)', re.I)
@@ -188,7 +188,7 @@ def parse_product_html(html: str, pid: int) -> dict:
             amount = usd_amount(nuxt_raw)
             if amount and nuxt_currency in ('KRW', 'USD'):
                 release = (amount, nuxt_currency)
-    if (not name or name.startswith(SITE_HOST.split('.', 1)[0].upper())) and nuxt_name:
+    if (not name or name.startswith(STOREFRONT_HOST.split('.', 1)[0].upper())) and nuxt_name:
         name = nuxt_name
     return {'id': pid, 'name': name[:220], 'url': f'{PUBLIC_ORIGIN}/products/{pid}', 'retail': release}
 
@@ -197,7 +197,7 @@ class Blocked(RuntimeError):
     pass
 
 
-class SiteClient:
+class StorefrontClient:
     def __init__(self, timeout: int = 18, gap_seconds: float = 2.0):
         self.session = requests.Session()
         self.session.headers.update({
@@ -205,7 +205,7 @@ class SiteClient:
             'Accept': 'application/json, text/html;q=0.9,*/*;q=0.8',
             'Referer': f'{PUBLIC_ORIGIN}/',
             'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.6',
-            VERSION_HEADER: os.getenv('SITE_API_VERSION', '65').strip() or '65',
+            API_VERSION_HEADER: os.getenv('SITE_API_VERSION', '65').strip() or '65',
         })
         self.timeout = timeout
         self.gap = max(0.5, float(gap_seconds))
@@ -229,17 +229,16 @@ class SiteClient:
         # local-time metadata. None of these are account credentials or a way to
         # bypass access restrictions. Do NOT copy browser Bearer tokens here.
         headers = {}
-        if host == f'api.{SITE_HOST}':
-            prefix = SITE_HOST.split('.', 1)[0]
+        if host == f'api.{STOREFRONT_HOST}':
             headers = {
                 'Accept': 'application/json',
                 'Origin': PUBLIC_ORIGIN,
-                f'x-{prefix}-client-datetime': datetime.now(
+                CLIENT_TIME_HEADER: datetime.now(
                     timezone(timedelta(hours=9))).strftime('%Y%m%d%H%M%S%z'),
             }
             build = os.getenv('SITE_WEB_BUILD_VERSION', '26.14.1').strip()
             if build:
-                headers[f'x-{prefix}-web-build-version'] = build
+                headers[BUILD_VERSION_HEADER] = build
         response = self.session.get(url, params=params, headers=headers, timeout=self.timeout)
         if response.status_code in (403, 429):
             self.blocked_until = time.monotonic() + max(60, int(os.getenv('SITE_BLOCK_BACKOFF_SECONDS', '900')))
@@ -446,7 +445,7 @@ def cheap_asks(pid: int, name: str, reference: int, reference_label: str,
     return sorted(deals.values(), key=lambda x: (Decimal(x['discount']) * -1, x['price']))
 
 
-def discover(config: dict, state: dict, client: SiteClient | None = None) -> list[int]:
+def discover(config: dict, state: dict, client: StorefrontClient | None = None) -> list[int]:
     """Ranking-only cumulative discovery. Never switch to general shop/search.
 
     Historical product IDs are append-only from the first successful ranking
@@ -470,7 +469,7 @@ def discover(config: dict, state: dict, client: SiteClient | None = None) -> lis
 
     urls = settings.get('urls', [])
     fresh, success_urls, warnings = collect_rankings(
-        client or SiteClient(int(config.get('timeout_seconds', 18)), float(config.get('api_gap_seconds', 1.5))),
+        client or StorefrontClient(int(config.get('timeout_seconds', 18)), float(config.get('api_gap_seconds', 1.5))),
         urls,
         scroll_steps=int(settings.get('scroll_steps', 0)),
         max_items_per_page=int(settings.get('max_items_per_page', 200)),
@@ -652,7 +651,7 @@ def checkpoint(path: Path) -> None:
         print('[STATE] 알림/탐색 이력 GitHub 동기화 완료', flush=True)
 
 
-def monitor_once(config: dict, state: dict, client: SiteClient, *, dry_run: bool = False) -> tuple[int, dict]:
+def monitor_once(config: dict, state: dict, client: StorefrontClient, *, dry_run: bool = False) -> tuple[int, dict]:
     """One scan with a soft time budget; never mark blocked products sold out.
 
     Larger batches speed up ranking-history coverage on responsive endpoints.
@@ -819,7 +818,7 @@ def loop(config_file: Path, state_file: Path, *, interval: int, duration: int, g
     state = read_state(state_file)
     if not dry_run:
         discord_webhook()  # Fail fast, even when the first pass has no deals.
-    client = SiteClient(int(config.get('timeout_seconds', 18)), float(config.get('api_gap_seconds', 2)))
+    client = StorefrontClient(int(config.get('timeout_seconds', 18)), float(config.get('api_gap_seconds', 2)))
     deadline = time.monotonic() + duration
     success = 0
     iteration = 0
@@ -901,7 +900,7 @@ def _probe_endpoint(label: str, action) -> tuple[bool, dict]:
         return False, result
 
 
-def probe_static_reachability(client: SiteClient) -> dict:
+def probe_static_reachability(client: StorefrontClient) -> dict:
     """One safe static GET distinguishes wide network failures from app-only failures.
 
     Does not prove product API access and never transmits user credentials.
@@ -934,7 +933,7 @@ def probe(config: dict, state_file: Path | None = None) -> int:
     can be used when rankings return errors. No product or price is fabricated.
     Ranking failure remains a failure in the final diagnostic exit code.
     """
-    client = SiteClient(int(config.get('timeout_seconds', 18)), float(config.get('api_gap_seconds', 2)))
+    client = StorefrontClient(int(config.get('timeout_seconds', 18)), float(config.get('api_gap_seconds', 2)))
     print('[PROBE NETWORK]', json.dumps(probe_static_reachability(client), ensure_ascii=False), flush=True)
     settings = config['discovery']
     successful, warnings, ranking_error = [], [], None
