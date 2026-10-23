@@ -199,6 +199,9 @@ class Blocked(RuntimeError):
 
 class StorefrontClient:
     def __init__(self, timeout: int = 18, gap_seconds: float = 2.0):
+        self.api_transport = os.getenv('SITE_API_TRANSPORT', 'requests').strip().lower()
+        if self.api_transport not in ('requests', 'chromium'):
+            raise ValueError('SITE_API_TRANSPORT는 requests 또는 chromium이어야 합니다')
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
@@ -213,6 +216,42 @@ class StorefrontClient:
         self.blocked_until = 0.0
         self.consecutive_product_5xx = 0
         self.product_pause_until = 0.0
+
+    def _chromium_get(self, url: str, params: dict | None, headers: dict) -> requests.Response:
+        """Opt-in real Chromium navigation with public API headers.
+
+        A fresh anonymous context avoids importing account cookies or keeping
+        a sync Playwright loop alive during ranking discovery. Errors never
+        trigger an automatic retry or transport switch.
+        """
+        from playwright.sync_api import sync_playwright, TimeoutError as BrowserTimeout
+        prepared = requests.Request('GET', url, params=params).prepare()
+        extra_headers = dict(self.session.headers)
+        extra_headers.update(headers)
+        for name in ('User-Agent', 'Accept-Encoding', 'Connection'):
+            extra_headers.pop(name, None)
+        try:
+            with sync_playwright() as pw:
+                browser = pw.chromium.launch(headless=True, args=['--no-sandbox'])
+                try:
+                    context = browser.new_context(locale='ko-KR', extra_http_headers=extra_headers)
+                    page = context.new_page()
+                    received = page.goto(prepared.url, wait_until='domcontentloaded',
+                                         timeout=self.timeout * 1000)
+                    if received is None:
+                        raise requests.ConnectionError('Chromium API 응답 없음')
+                    response = requests.Response()
+                    response.status_code = received.status
+                    response.headers.update(received.headers)
+                    response.url = received.url
+                    response.request = prepared
+                    response._content = received.body() if received.status < 400 else b''
+                    response.encoding = 'utf-8'
+                    return response
+                finally:
+                    browser.close()
+        except BrowserTimeout:
+            raise requests.ReadTimeout('Chromium API 요청 시간 초과') from None
 
     def get(self, url: str, params: dict | None = None) -> requests.Response:
         host = urlparse(url).hostname
@@ -239,7 +278,10 @@ class StorefrontClient:
             build = os.getenv('SITE_WEB_BUILD_VERSION', '26.14.1').strip()
             if build:
                 headers[BUILD_VERSION_HEADER] = build
-        response = self.session.get(url, params=params, headers=headers, timeout=self.timeout)
+        if host == f'api.{STOREFRONT_HOST}' and self.api_transport == 'chromium':
+            response = self._chromium_get(url, params, headers)
+        else:
+            response = self.session.get(url, params=params, headers=headers, timeout=self.timeout)
         if response.status_code in (403, 429):
             self.blocked_until = time.monotonic() + max(60, int(os.getenv('SITE_BLOCK_BACKOFF_SECONDS', '900')))
             raise Blocked(f'상점 HTTP {response.status_code}: GitHub 러너 요청 거부/제한')
@@ -822,7 +864,8 @@ def loop(config_file: Path, state_file: Path, *, interval: int, duration: int, g
     deadline = time.monotonic() + duration
     success = 0
     iteration = 0
-    print(f'[START] {interval}초 간격, 실행 {duration}초, Git sync={git_sync}', flush=True)
+    print(f'[START] {interval}초 간격, 실행 {duration}초, Git sync={git_sync}, '
+          f'API transport={client.api_transport}', flush=True)
     while True:
         iteration += 1
         started = time.monotonic()
@@ -934,6 +977,14 @@ def probe(config: dict, state_file: Path | None = None) -> int:
     Ranking failure remains a failure in the final diagnostic exit code.
     """
     client = StorefrontClient(int(config.get('timeout_seconds', 18)), float(config.get('api_gap_seconds', 2)))
+    print('[PROBE TRANSPORT]', json.dumps({
+        'html_transport': 'requests', 'api_transport': client.api_transport,
+        'api_host': urlparse(API_ORIGIN).hostname,
+        'api_version': client.session.headers[API_VERSION_HEADER],
+        'web_build_version': os.getenv('SITE_WEB_BUILD_VERSION', '26.14.1').strip(),
+        'proxy_env_present': any(os.getenv(k) for k in (
+            'HTTPS_PROXY', 'https_proxy', 'ALL_PROXY', 'all_proxy')),
+    }, ensure_ascii=False), flush=True)
     print('[PROBE NETWORK]', json.dumps(probe_static_reachability(client), ensure_ascii=False), flush=True)
     settings = config['discovery']
     successful, warnings, ranking_error = [], [], None
@@ -988,18 +1039,27 @@ def probe(config: dict, state_file: Path | None = None) -> int:
         if time.monotonic() < client.blocked_until:
             print('[PROBE STOP] HTTP 403/429 대기 요청을 반복하지 않습니다', file=sys.stderr, flush=True)
             break
-        if all(v.get('http_status') in (500, 502, 503, 504) for v in sources.values()):
-            print('[PROBE STOP] 상품 상세/최근거래가/매도호가가 모두 HTTP 5xx입니다. '
-                  '동일 실행에서 다른 상품에 반복 요청하지 않습니다.', file=sys.stderr, flush=True)
+        if all(sources[k].get('http_status') in (500, 502, 503, 504) for k in ('sales', 'asks')):
+            print('[PROBE STOP] 이 상품의 거래·호가 API가 모두 HTTP 5xx입니다. '
+                  'HTML 성공 여부와 관계없이 추가 상품 진단을 중단합니다. '
+                  '서비스 전체 장애로 확정한 것은 아닙니다.', file=sys.stderr, flush=True)
             break
 
     summary = {'checked_products': len(checked),
+               'api_transport': client.api_transport,
                'product_success': sum(x['sources']['product']['status'] == 'ok' for x in checked),
                'sales_success': sum(x['sources']['sales']['status'] == 'ok' for x in checked),
                'asks_success': sum(x['sources']['asks']['status'] == 'ok' for x in checked),
                'complete_product_success': full_success,
                'ranking_success': ranking_error is None and len(successful) == len(settings['urls']),
                'ranking_from_saved_history': ranking_error is not None and bool(found)}
+    if checked and all(x['sources']['product']['status'] == 'ok' for x in checked) and all(
+            x['sources'][kind].get('http_status') in (500, 502, 503, 504)
+            for x in checked for kind in ('sales', 'asks')):
+        print('[PROBE HELP] 상품 HTML은 정상이며 거래·호가 API에서만 5xx가 관측됐습니다. '
+              'API 접속 경로/클라이언트 요구사항/서버 오류를 구분해야 합니다. '
+              '실행 입력의 api_transport를 바꾸어 같은 상품 결과를 비교하세요. '
+              '브라우저 방식도 성공을 보장하지 않습니다.', file=sys.stderr, flush=True)
     print('[PROBE SUMMARY]', json.dumps(summary, ensure_ascii=False), flush=True)
     if not full_success:
         print('[PROBE PRODUCT FAILED] 최근거래가, 상품 상세 및 매도 호가는 각각 독립적으로 확인했습니다. '
