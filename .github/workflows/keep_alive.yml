@@ -1,0 +1,27 @@
+name: Scheduled Workflow Keep Alive
+
+on:
+  # Separate weekly maintenance schedule; monitor.yml cron remains unchanged.
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  keep-alive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository metadata
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Keep the monitor schedule active
+        uses: gautamkrishnar/keepalive-workflow@v2
+        with:
+          workflow_files: "monitor.yml, keep_alive.yml"
+          time_elapsed: "30"
+          use_api: true
