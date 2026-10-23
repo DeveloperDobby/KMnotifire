@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Ranked-product hot-deal monitor. Read-only storefront access; Discord webhook notifications.
 
-No external executable, site login or cookies required. Unofficial Storefront APIs may
-change or refuse GitHub-hosted runner traffic; failures never mean 'sold out'.
+Optional API credentials are supplied through environment variables only.
+Unofficial APIs may change or refuse access; failures never mean 'sold out'.
 """
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ import requests
 from product_metadata import parse_pdp_nuxt_retail
 from ranking_sources import collect_rankings, validate_ranking_url
 
-from storefront import PUBLIC_ORIGIN, API_ORIGIN, PUBLIC_HOSTS, REQUEST_HOSTS, STOREFRONT_HOST, API_VERSION_HEADER, CLIENT_TIME_HEADER, BUILD_VERSION_HEADER
+from storefront import PUBLIC_ORIGIN, API_ORIGIN, PUBLIC_HOSTS, REQUEST_HOSTS, STOREFRONT_HOST, API_VERSION_HEADER, CLIENT_TIME_HEADER, BUILD_VERSION_HEADER, DEVICE_ID_HEADER, WEB_REQUEST_HEADER
 STATE_VERSION = 1
 ID_PATTERN = re.compile(r'/products/(\d+)(?:[/?#]|$)')
 CURRENCY_PATTERN = re.compile(r'\$\s*([\d,]+(?:\.\d+)?)|(?:USD|US\$)\s*([\d,]+(?:\.\d+)?)|([\d,]+(?:\.\d+)?)\s*(?:원|KRW)|([\d,]+(?:\.\d+)?)\s*(?:USD|달러)', re.I)
@@ -197,11 +197,25 @@ class Blocked(RuntimeError):
     pass
 
 
+class AuthenticationRequired(requests.HTTPError):
+    pass
+
+
 class StorefrontClient:
     def __init__(self, timeout: int = 18, gap_seconds: float = 2.0):
         self.api_transport = os.getenv('SITE_API_TRANSPORT', 'requests').strip().lower()
         if self.api_transport not in ('requests', 'chromium'):
             raise ValueError('SITE_API_TRANSPORT는 requests 또는 chromium이어야 합니다')
+        self.access_token = self._secret('SITE_ACCESS_TOKEN')
+        if self.access_token.lower().startswith('bearer '):
+            self.access_token = self.access_token[7:].strip()
+        if self.access_token and not re.fullmatch(r'[A-Za-z0-9._~+/=-]+', self.access_token):
+            raise ValueError('SITE_ACCESS_TOKEN 형식 오류: 토큰 값만 입력하세요')
+        self.web_request_secret = self._secret('SITE_WEB_REQUEST_SECRET')
+        self.device_id = self._secret('SITE_DEVICE_ID') or f'web;{uuid.uuid4()}'
+        self.authentication_failed = False
+        if self.api_transport == 'chromium' and (self.access_token or self.web_request_secret):
+            raise ValueError('인증 헤더는 requests 방식에서만 지원합니다. api_transport=requests를 선택하세요')
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
@@ -216,6 +230,13 @@ class StorefrontClient:
         self.blocked_until = 0.0
         self.consecutive_product_5xx = 0
         self.product_pause_until = 0.0
+
+    @staticmethod
+    def _secret(name: str) -> str:
+        value = os.getenv(name, '').strip()
+        if any(ord(c) < 32 or ord(c) >= 127 for c in value):
+            raise ValueError(f'{name}: HTTP 헤더에 사용할 수 없는 문자')
+        return value
 
     def _chromium_get(self, url: str, params: dict | None, headers: dict) -> requests.Response:
         """Opt-in real Chromium navigation with public API headers.
@@ -254,9 +275,14 @@ class StorefrontClient:
             raise requests.ReadTimeout('Chromium API 요청 시간 초과') from None
 
     def get(self, url: str, params: dict | None = None) -> requests.Response:
-        host = urlparse(url).hostname
-        if host not in REQUEST_HOSTS or not url.startswith('https://'):
+        target = urlparse(url)
+        host = target.hostname
+        if (host not in REQUEST_HOSTS or target.scheme != 'https' or target.username
+                or target.password or target.port not in (None, 443)):
             raise ValueError('허용되지 않은 요청 대상')
+        is_api = host == urlparse(API_ORIGIN).hostname
+        if is_api and self.authentication_failed:
+            raise AuthenticationRequired('이 실행에서 API 인증 실패가 확인되어 추가 요청을 중단했습니다')
         backoff_remaining = self.blocked_until - time.monotonic()
         if backoff_remaining > 0:
             raise Blocked(f'서비스 요청 대기: {backoff_remaining:.0f}초 후 재시도')
@@ -264,24 +290,38 @@ class StorefrontClient:
         if sleep > 0:
             time.sleep(sleep)
         self.next_request_at = time.monotonic() + self.gap
-        # The website's observed browser GET includes public client-version and
-        # local-time metadata. None of these are account credentials or a way to
-        # bypass access restrictions. Do NOT copy browser Bearer tokens here.
+        # Keep credentials out of shared session headers, HTML and redirects.
         headers = {}
-        if host == f'api.{STOREFRONT_HOST}':
+        if is_api:
+            product_path = re.fullmatch(r'/api/p/products/([1-9]\d*)/(sales|asks)', target.path)
+            if product_path is None:
+                raise ValueError('허용되지 않은 상품 API 경로')
             headers = {
-                'Accept': 'application/json',
+                'Accept': '*/*',
                 'Origin': PUBLIC_ORIGIN,
+                'Referer': f'{PUBLIC_ORIGIN}/products/{product_path.group(1)}',
+                DEVICE_ID_HEADER: self.device_id,
                 CLIENT_TIME_HEADER: datetime.now(
                     timezone(timedelta(hours=9))).strftime('%Y%m%d%H%M%S%z'),
             }
             build = os.getenv('SITE_WEB_BUILD_VERSION', '26.14.1').strip()
             if build:
                 headers[BUILD_VERSION_HEADER] = build
-        if host == f'api.{STOREFRONT_HOST}' and self.api_transport == 'chromium':
+            if self.access_token:
+                headers['Authorization'] = f'Bearer {self.access_token}'
+            if self.web_request_secret:
+                headers[WEB_REQUEST_HEADER] = self.web_request_secret
+        if is_api and self.api_transport == 'chromium':
             response = self._chromium_get(url, params, headers)
         else:
-            response = self.session.get(url, params=params, headers=headers, timeout=self.timeout)
+            response = self.session.get(url, params=params, headers=headers, timeout=self.timeout,
+                                        allow_redirects=not is_api)
+        if is_api and 300 <= response.status_code < 400:
+            raise requests.HTTPError('API 리다이렉트는 인증 정보 보호를 위해 따르지 않습니다', response=response)
+        if is_api and response.status_code == 401:
+            self.authentication_failed = True
+            raise AuthenticationRequired('API HTTP 401: SITE_ACCESS_TOKEN 누락·만료·거부 여부를 확인하세요',
+                                         response=response)
         if response.status_code in (403, 429):
             self.blocked_until = time.monotonic() + max(60, int(os.getenv('SITE_BLOCK_BACKOFF_SECONDS', '900')))
             raise Blocked(f'상점 HTTP {response.status_code}: GitHub 러너 요청 거부/제한')
@@ -808,6 +848,14 @@ def monitor_once(config: dict, state: dict, client: StorefrontClient, *, dry_run
             else:
                 next_history = (position_by_id[pid] + 1) % len(ids)
             print(f'[SCAN] id={pid} deals={len(deals)} notified={notifications} name={product["name"][:50]}', flush=True)
+        except AuthenticationRequired as exc:
+            issues += 1
+            if track == 'priority':
+                next_priority = current_position[pid]
+            else:
+                next_history = position_by_id[pid]
+            print(f'[AUTH ERROR] {exc}', file=sys.stderr, flush=True)
+            break
         except Blocked as exc:
             issues += 1
             # Retry this exact item after the site's backoff, not the next batch.
@@ -890,6 +938,9 @@ def loop(config_file: Path, state_file: Path, *, interval: int, duration: int, g
                     checkpoint(state_file)
                 except Exception as exc:
                     print(f'[STATE ERROR] {type(exc).__name__}: 다음 주기 재시도', file=sys.stderr, flush=True)
+        if client.authentication_failed:
+            print('[STOP] API 인증 실패. 자격증명을 갱신한 뒤 새 실행이 필요합니다.', file=sys.stderr, flush=True)
+            return 1
         if time.monotonic() >= deadline:
             break
         remaining = min(deadline - time.monotonic(), started + interval - time.monotonic())
@@ -969,11 +1020,11 @@ def probe_static_reachability(client: StorefrontClient) -> dict:
         }
 
 
-def probe(config: dict, state_file: Path | None = None) -> int:
+def probe(config: dict, state_file: Path | None = None, product_id: int | None = None) -> int:
     """Diagnose each source independently, even if this run's ranking is down.
 
-    Only product IDs previously *proven* to be ranked in the persisted state
-    can be used when rankings return errors. No product or price is fabricated.
+    History fallback uses previously ranked IDs. An explicitly requested ID
+    is diagnostic-only and is never added to ranking or monitoring state.
     Ranking failure remains a failure in the final diagnostic exit code.
     """
     client = StorefrontClient(int(config.get('timeout_seconds', 18)), float(config.get('api_gap_seconds', 2)))
@@ -982,6 +1033,9 @@ def probe(config: dict, state_file: Path | None = None) -> int:
         'api_host': urlparse(API_ORIGIN).hostname,
         'api_version': client.session.headers[API_VERSION_HEADER],
         'web_build_version': os.getenv('SITE_WEB_BUILD_VERSION', '26.14.1').strip(),
+        'authorization_present': bool(client.access_token),
+        'web_request_header_present': bool(client.web_request_secret),
+        'device_id_source': 'configured' if os.getenv('SITE_DEVICE_ID', '').strip() else 'generated',
         'proxy_env_present': any(os.getenv(k) for k in (
             'HTTPS_PROXY', 'https_proxy', 'ALL_PROXY', 'all_proxy')),
     }, ensure_ascii=False), flush=True)
@@ -1024,15 +1078,24 @@ def probe(config: dict, state_file: Path | None = None) -> int:
 
     checked: list[dict] = []
     full_success = False
-    for pid in found[:4]:
+    candidates = [product_id] if product_id is not None else found[:4]
+    for pid in candidates:
         # The storefront may expose ranked retail-only goods without asks or
         # past sales. Use multiple ranked products to avoid a false conclusion.
         sources = {}
         ok_product, sources['product'] = _probe_endpoint('product', lambda: client.product(pid))
         ok_sales, sources['sales'] = _probe_endpoint('sales', lambda: client.sales_by_size(pid, max_pages=1))
-        ok_asks, sources['asks'] = _probe_endpoint('asks', lambda: client.asks(pid, max_pages=1))
+        if client.authentication_failed:
+            ok_asks = False
+            sources['asks'] = {'status': 'skipped', 'reason': 'API 인증 실패로 추가 요청 생략'}
+        else:
+            ok_asks, sources['asks'] = _probe_endpoint('asks', lambda: client.asks(pid, max_pages=1))
         checked.append({'product_id': pid, 'sources': sources})
         print('[PROBE PRODUCT]', json.dumps(checked[-1], ensure_ascii=False), flush=True)
+        if client.authentication_failed:
+            print('[PROBE STOP] API 인증 실패. Secrets의 자격증명을 갱신한 뒤 다시 실행하세요.',
+                  file=sys.stderr, flush=True)
+            break
         if ok_product and ok_sales and ok_asks:
             full_success = True
             break
@@ -1046,6 +1109,7 @@ def probe(config: dict, state_file: Path | None = None) -> int:
             break
 
     summary = {'checked_products': len(checked),
+               'explicit_probe_product_id': product_id,
                'api_transport': client.api_transport,
                'product_success': sum(x['sources']['product']['status'] == 'ok' for x in checked),
                'sales_success': sum(x['sources']['sales']['status'] == 'ok' for x in checked),
@@ -1058,8 +1122,9 @@ def probe(config: dict, state_file: Path | None = None) -> int:
             for x in checked for kind in ('sales', 'asks')):
         print('[PROBE HELP] 상품 HTML은 정상이며 거래·호가 API에서만 5xx가 관측됐습니다. '
               'API 접속 경로/클라이언트 요구사항/서버 오류를 구분해야 합니다. '
-              '실행 입력의 api_transport를 바꾸어 같은 상품 결과를 비교하세요. '
-              '브라우저 방식도 성공을 보장하지 않습니다.', file=sys.stderr, flush=True)
+              '성공한 브라우저 요청과 인증 헤더 설정 여부를 비교하세요. '
+              '인증 헤더를 추가해도 실행 환경 문제까지 해결된다고 보장할 수 없습니다.',
+              file=sys.stderr, flush=True)
     print('[PROBE SUMMARY]', json.dumps(summary, ensure_ascii=False), flush=True)
     if not full_success:
         print('[PROBE PRODUCT FAILED] 최근거래가, 상품 상세 및 매도 호가는 각각 독립적으로 확인했습니다. '
@@ -1075,14 +1140,17 @@ def main() -> int:
     parser.add_argument('--loop', action='store_true')
     parser.add_argument('--git-sync', action='store_true')
     parser.add_argument('--probe', action='store_true')
+    parser.add_argument('--probe-product', type=int, help='브라우저와 비교할 상품 ID; --probe 전용, 상태 변경 없음')
     parser.add_argument('--dry-run', action='store_true')
     args = parser.parse_args()
     if args.dry_run and args.git_sync:
         parser.error('--dry-run과 --git-sync를 동시에 사용할 수 없습니다')
+    if args.probe_product is not None and (not args.probe or args.probe_product <= 0):
+        parser.error('--probe-product는 --probe와 함께 양수 상품 ID로 지정해야 합니다')
     config = load_json(args.config)
     validate_config(config)
     if args.probe:
-        return probe(config, args.state)
+        return probe(config, args.state, args.probe_product)
     interval = int(os.getenv('CHECK_INTERVAL_SECONDS', '60'))
     duration = int(os.getenv('RUN_DURATION_SECONDS', '21480')) if args.loop else 1
     if interval <= 0 or duration <= 0:
