@@ -12,13 +12,17 @@ on:
         default: false
         required: false
       api_transport:
-        description: "API 비교 방식 (default는 저장소 변수 SITE_API_TRANSPORT 또는 requests 사용)"
+        description: "인증 헤더 사용 시 requests 선택 (chromium은 비인증 비교 전용)"
         type: choice
         options:
           - default
           - requests
           - chromium
         default: default
+        required: false
+      probe_product_id:
+        description: "선택: 브라우저에서 성공한 상품 ID와 비교 (probe_only 전용)"
+        type: string
         required: false
 
 permissions:
@@ -78,11 +82,24 @@ jobs:
 
       - name: Diagnose ranking and product APIs
         if: ${{ inputs.probe_only == true }}
-        run: python deal_monitor.py --probe
+        env:
+          SITE_ACCESS_TOKEN: ${{ secrets.SITE_ACCESS_TOKEN }}
+          SITE_DEVICE_ID: ${{ secrets.SITE_DEVICE_ID }}
+          SITE_WEB_REQUEST_SECRET: ${{ secrets.SITE_WEB_REQUEST_SECRET }}
+          PROBE_PRODUCT_ID: ${{ inputs.probe_product_id }}
+        run: |
+          if [ -n "${PROBE_PRODUCT_ID}" ]; then
+            python deal_monitor.py --probe --probe-product "${PROBE_PRODUCT_ID}"
+          else
+            python deal_monitor.py --probe
+          fi
 
       - name: Check historical ranked deals every 60 seconds
         if: ${{ inputs.probe_only != true }}
         env:
+          SITE_ACCESS_TOKEN: ${{ secrets.SITE_ACCESS_TOKEN }}
+          SITE_DEVICE_ID: ${{ secrets.SITE_DEVICE_ID }}
+          SITE_WEB_REQUEST_SECRET: ${{ secrets.SITE_WEB_REQUEST_SECRET }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           DISCORD_USER_ID: ${{ secrets.DISCORD_USER_ID }}
           USD_KRW_RATE: ${{ secrets.USD_KRW_RATE }}
